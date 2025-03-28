@@ -1,0 +1,9 @@
+[
+  {
+    "Classification": "trino-connector-hive",
+    "Properties": {
+      "hive.metastore": "glue"
+    }
+  }
+]
+
