@@ -3,10 +3,9 @@ import logging
 import os
 
 BUCKET_NAME='<bucket_name>'
-S_FACTORS = ['s1','s10','s100']
+S_FACTORS = ['s10','s100']
 
-INITIAL_DATASET_PERCENTAGE = .5
-ADDITIONAL_DATASET_COUNT = 5
+INCREMENTAL_DATASET_COUNT = 100
 
 logging.basicConfig(
     format="%(asctime)s, %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s",
@@ -92,6 +91,10 @@ columns_per_table = {
 def generate_parsed_parquet(input_file, parquet_filename, column_names):
     input_file = f"{s_factor}/{table_name}.tbl"
     columns_select_statement = ','.join(column_names)
+        
+    #format datekey so athena automatically detects the correct type
+    if "D_DATEKEY" in column_names:
+        columns_select_statement = columns_select_statement.replace("D_DATEKEY", "CAST(strptime(CAST(D_DATEKEY AS varchar), '%Y%m%d') AS DATE) AS D_DATEKEY")
     
     logging.info("Creating parsed parquet file...")
     ddb.sql(f"""
@@ -109,29 +112,17 @@ def get_total_data_count(parquet_filename):
         """).fetchone()[0]
     return total_data_count
 
-def output_initial_dataset_to_s3(parquet_filename, s3_base_path, initial_dataset_count):
-    logging.info("Saving initial dataset to s3...")
-    path = s3_base_path+"/initial/data.parquet"
-    ddb.sql(f"""
-        COPY (
-                select * from
-                read_parquet('{parquet_filename}')
-                limit {initial_dataset_count}
-        ) TO '{path}';
-        """)
-    logging.info("Saving done!")
 
-def calculate_additional_limits_and_offsets(initial_dataset_count, total_data_count):
+def calculate_incremental_limits_and_offsets(total_data_count):
     # Calculate the approximate size of each chunk
-    remainder_data_size = total_data_count- initial_dataset_count
-    additional_chunk_size = remainder_data_size // ADDITIONAL_DATASET_COUNT
-    remainder = remainder_data_size % ADDITIONAL_DATASET_COUNT  # Extra elements to distribute
+    additional_chunk_size = total_data_count // INCREMENTAL_DATASET_COUNT
+    remainder = total_data_count % INCREMENTAL_DATASET_COUNT  # Extra elements to distribute
 
     limits = []
     offsets = []
-    offset = initial_dataset_count
+    offset = 0
 
-    for i in range(ADDITIONAL_DATASET_COUNT):
+    for i in range(INCREMENTAL_DATASET_COUNT):
         # Calculate the size for this chunk (add 1 if within remainder)
         current_chunk_size = additional_chunk_size + (1 if i < remainder else 0)
         limit = current_chunk_size
@@ -145,12 +136,12 @@ def calculate_additional_limits_and_offsets(initial_dataset_count, total_data_co
 
     return offsets,limits
 
-def output_additional_datasets_to_s3(parquet_filename, s3_base_path, initial_dataset_count, total_data_count):
+def output_additional_datasets_to_s3(parquet_filename, s3_base_path, total_data_count):
     logging.info("Saving additional dataset to s3...")
-    offsets, limits = calculate_additional_limits_and_offsets(initial_dataset_count,total_data_count)
+    offsets, limits = calculate_incremental_limits_and_offsets(total_data_count)
     
-    for i in range(ADDITIONAL_DATASET_COUNT):
-        output_path = s3_base_path+f"/additional_{i}/data.parquet"
+    for i in range(INCREMENTAL_DATASET_COUNT):
+        output_path = s3_base_path+f"/incremental/{i}/data.parquet"
         logging.info(f"Processing additional dataset {i}")
         ddb.sql(f"""
             COPY (
@@ -164,7 +155,7 @@ def output_additional_datasets_to_s3(parquet_filename, s3_base_path, initial_dat
 
 def output_full_dataset_to_s3(parquet_filename, s3_base_path):
     logging.info("Saving full dataset to s3...")
-    path = s3_base_path+"/initial/data.parquet"
+    path = s3_base_path+"/full/data.parquet"
     ddb.sql(f"""
         COPY (
                 select * from
@@ -199,15 +190,12 @@ for s_factor in S_FACTORS:
         
         
         generate_parsed_parquet(input_file, parquet_filename, column_names)
-        total_data_count = get_total_data_count(parquet_filename)
+        output_full_dataset_to_s3(parquet_filename,s3_base_path)
         
-        initial_dataset_count = int(total_data_count*INITIAL_DATASET_PERCENTAGE)
+        total_data_count = get_total_data_count(parquet_filename)
         if table_name=='lineorder':
             total_data_count = get_total_data_count(parquet_filename)
-            output_initial_dataset_to_s3(parquet_filename,s3_base_path, initial_dataset_count)
-            output_additional_datasets_to_s3(parquet_filename, s3_base_path, initial_dataset_count, total_data_count)
-        else:    
-            output_full_dataset_to_s3(parquet_filename,s3_base_path)
+            output_additional_datasets_to_s3(parquet_filename, s3_base_path, total_data_count)
        
         os.remove(parquet_filename)
     
